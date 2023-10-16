@@ -1,0 +1,1 @@
+g++ main.cpp cha.cpp topology.cpp -lpthread -lm
