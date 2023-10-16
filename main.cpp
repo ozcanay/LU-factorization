@@ -63,6 +63,7 @@ Written shared data is A matrix. I will mark the lines that this specific matrix
 */
 
 
+#include <algorithm>
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -80,6 +81,8 @@ Written shared data is A matrix. I will mark the lines that this specific matrix
 #define PAGE_SIZE 4096
 #define __MAX_THREADS__ 256
 
+const int CACHELINE_SIZE = 64;
+
 #include <mutex>
 #include <map>
 #include <set>
@@ -91,7 +94,7 @@ Written shared data is A matrix. I will mark the lines that this specific matrix
 #include "topology.hpp"
 // AYDIN
 std::mutex map_mutex;
-std::map<int, std::multiset<double *>> // TODO: set the address type accordingly.
+std::map<long, std::multiset<double *>> // TODO: set the address type accordingly.
     threadid_addresses_map;  // will use std::set_intersection. that is why I used a set. I picked multiset instead of
                              // set since if a thread pair communicates over same addresses multiple times, I want to
                              // take this into account.
@@ -150,6 +153,7 @@ int getMostAccessedCHA(int tid1,
         // SPDLOG_INFO("cha {}, x: {}, y: {}", tile.cha, tile.x, tile.y);
     }
 
+    assert(cha_count != 0);
     int x_coord = x_total / cha_count;
     int y_coord = y_total / cha_count;
     auto tile = topo.getTile(x_coord, y_coord);
@@ -240,13 +244,13 @@ long test_result = 0;        /* Test result of factorization? */
 long doprint = 0;            /* Print out matrix values? */
 long dostats = 0;            /* Print out individual processor statistics? */
 
-void SlaveStart(void);
+void* SlaveStart(void*);
 void OneSolve(long n, long block_size, long MyNum, long dostats);
-void lu0(double *a, long n, long stride);
-void bdiv(double *a, double *diag, long stride_a, long stride_diag, long dimi, long dimk);
-void bmodd(double *a, double *c, long dimi, long dimj, long stride_a, long stride_c);
-void bmod(double *a, double *b, double *c, long dimi, long dimj, long dimk, long stride);
-void daxpy(double *a, double *b, long n, double alpha);
+void lu0(double *a, long n, long stride, long MyNum);
+void bdiv(double *a, double *diag, long stride_a, long stride_diag, long dimi, long dimk, long MyNum);
+void bmodd(double *a, double *c, long dimi, long dimj, long stride_a, long stride_c, long MyNum);
+void bmod(double *a, double *b, double *c, long dimi, long dimj, long dimk, long stride, long MyNum);
+void daxpy(double *a, double *b, long n, double alpha, long MyNum);
 long BlockOwner(long I, long J);
 long BlockOwnerColumn(long I, long J);
 long BlockOwnerRow(long I, long J);
@@ -256,6 +260,14 @@ double TouchA(long bs, long MyNum);
 void PrintA(void);
 void CheckResult(long n, double *a, double *rhs);
 void printerr(const char *s);
+
+
+
+int findCha(const double* val)
+{
+  // this part is changed wrt fluidanimate.
+    return findCHAByHashing(reinterpret_cast<uintptr_t>(val)); // AYDIN: this is not &val, right?
+}
 
 int main(int argc, char *argv[])
 {
@@ -327,7 +339,10 @@ int main(int argc, char *argv[])
     nblocks++;
   }
 
-  a = (double *) malloc(n*n*sizeof(double));;
+  // a = (double *) malloc(n*n*sizeof(double));
+  const int ret = posix_memalign((void **)(&a), CACHELINE_SIZE, n*n*sizeof(double));
+  assert(ret == 0);
+
   if (a == NULL) {
 	  printerr("Could not malloc memory for a.\n");
 	  exit(-1);
@@ -383,15 +398,28 @@ int main(int argc, char *argv[])
     PrintA();
   }
 
-  ;
 
-  {
-	long	i, Error;
+  std::cout << "base cores: ";
+    std::vector<int> base_assigned_cores;
+    for (int i = 0; i < getCoreCount(); ++i)
+    {
+        if (i % 2 == 0)
+        {
+            base_assigned_cores.push_back(i);
+            std::cout << i << ' ';
+            // this is to bind cores in socket-0. all cores are even numbered in this socket.
+        }
+    }
+    std::cout << std::endl;
+    assert(base_assigned_cores.size() == P);  
 
+  // ADDRESS-THREAD_ID TRACKING STARTS HERE.
+  std::cout << "Starting address tracking..." << std::endl;
+  const auto address_tracking_start = high_resolution_clock::now();
 	assert(__threads__<__MAX_THREADS__);
 	pthread_mutex_lock(&__intern__);
-	for (i = 0; i < (P) - 1; i++) {
-		Error = pthread_create(&__tid__[__threads__++], NULL, (void * (*)(void *))(SlaveStart), NULL);
+	for (int i = 0; i < (P) - 1; i++) {
+		const int Error = pthread_create(&__tid__[__threads__++], NULL, SlaveStart, static_cast<void*>(base_assigned_cores.data()));
 		if (Error != 0) {
 			printf("Error in pthread_create().\n");
 			exit(-1);
@@ -399,11 +427,272 @@ int main(int argc, char *argv[])
 	}
 	pthread_mutex_unlock(&__intern__);
 
-	SlaveStart();
-};
+	SlaveStart(static_cast<void*>(base_assigned_cores.data()));
+  std::cout << "WAITING FOR JOIN..." << std::endl;
   {int aantal=P; while (aantal--) pthread_join(__tid__[aantal], NULL);};
+  std::cout << "AFTER JOIN" << std::endl;  
 
-  ;
+  const auto address_tracking_end = high_resolution_clock::now();
+  std::cout << "Ended address tracking. elapsed time: " << duration_cast<milliseconds>(address_tracking_end - address_tracking_start).count() << "ms" << std::endl;
+  Global->id = 0; // reset the id.
+  __threads__ = 0; // reset this, too.
+  (Global->start).bar_teller=0; // reset.
+  InitA(rhs); // reset.
+
+  // ADDRESS-THREAD_ID TRACKING IS DONE.
+
+
+
+
+  // ALGO HERE.
+  std::cout << "Starting preprocesing algo..." << std::endl;
+  const auto algo_start = high_resolution_clock::now();
+
+
+    assert(P > 1);  // below algo depends on this. we will find thread pairs.
+    auto head = threadid_addresses_map.begin();
+    auto tail = std::next(threadid_addresses_map.begin());
+
+    // this is ranked_communication_count_per_pair wrt spmv repo.
+    multiset<tuple<int, int, int>, greater<>>
+        total_comm_count_t1_t2;  // set should suffice (compared to multiset). no tuple will be
+                                 // the same since thread pairs are unique at this point here. but now, will make it multiset
+    std::multiset<tuple<int, int, int, int>, greater<>> total_cha_freq_count_t1_t2;
+
+    // map<pair<int, int>, multiset<Cell *>> pairing_addresses;
+    while (head != threadid_addresses_map.end()) {
+        const auto orig_tail = tail;
+        while (tail != threadid_addresses_map.end()) {
+            const int t1 = head->first;
+            const int t2 = tail->first;
+            // cout << "head: " << t1 << ", tail: " << t2 << endl;
+
+            const multiset<double *> t1_addresses = head->second;
+            const multiset<double *> t2_addresses = tail->second;
+
+            std::multiset<double *> common_addresses;
+            std::set_intersection(t1_addresses.begin(), t1_addresses.end(), t2_addresses.begin(), t2_addresses.end(),
+                                  std::inserter(common_addresses, common_addresses.begin()));
+
+            std::unordered_map<int, int> cha_freq_map;
+
+            // this part is changed wrt fluidanimate.
+            for(const double* common_addr : common_addresses) {
+              ++cha_freq_map[findCha(common_addr)];
+            }
+            // this part is changed wrt fluidanimate.
+
+
+            for(const auto& [cha, freq] : cha_freq_map) {
+                total_cha_freq_count_t1_t2.insert({freq, cha, t1, t2});
+            }
+
+            total_comm_count_t1_t2.insert({common_addresses.size(), t1, t2});
+            
+            // pairing_addresses[{t1, t2}] = common_addresses; // pairing is not used at the moment. here just for clarity.
+            ++tail;
+        }
+        tail = std::next(orig_tail);
+        ++head;
+    }
+
+    // for (const auto &[thread_pairs, common_addresses] : pairing_addresses) {
+    //     const auto t1 = thread_pairs.first;
+    //     const auto t2 = thread_pairs.second;
+    //     const auto common_address_count = common_addresses.size();
+    //     std::cout << "threads " << t1 << " and " << t2 << " have " << common_address_count << " common addresses"
+    //               << endl;
+    //     total_comm_count_t1_t2.insert({common_address_count, t1, t2});
+    // }
+
+
+
+    // for (const auto &[total_comm_count, t1, t2] : total_comm_count_t1_t2) {
+    //     std::cout << "total comm count: " << total_comm_count << ", t1: " << t1 << ", t2: " << t2 << endl;
+    // }
+    // for (const auto &[freq, cha, t1, t2] : total_cha_freq_count_t1_t2) {
+    //     std::cout << "freq: " << freq << ", cha: " << cha << ", t1: " << t1 << ", t2: " << t2 << endl;
+    // }    
+
+    int mapped_thread_count = 0;
+    auto it = total_cha_freq_count_t1_t2.begin();
+    auto it1 = total_comm_count_t1_t2.begin();
+    std::vector<int> thread_to_core(P, -1);
+
+    // fprintf(stderr, "before topology creation\n");
+    auto topo = Topology(cha_core_map, CAPID6);
+    std::vector<Tile> mapped_tiles;
+    // SPDLOG_TRACE("~~~~~~~~~~~~~~~~");
+    //  fprintf(stderr, "before thread mapping creation\n");
+
+    // start
+    // it = ranked_cha_access_count_per_pair.begin();
+    while (mapped_tiles.size() < P &&
+           /*it != ranked_cha_access_count_per_pair.end()*/ it1 != total_comm_count_t1_t2.end()) {
+        // std::pair<int, int> tid_pair(std::get<2>(*it), std::get<3>(*it));
+        std::pair<int, int> tid_pair(std::get<1>(*it1), std::get<2>(*it1));
+        if (thread_to_core[tid_pair.first] == -1 && thread_to_core[tid_pair.second] == -1) {
+            // SPDLOG_TRACE("cha with max access: {}", std::get<1>(*it));
+            int cha_id = getMostAccessedCHA(tid_pair.first, tid_pair.second, total_cha_freq_count_t1_t2, topo);
+            if (cha_id == -1) {
+                // SPDLOG_INFO("error: cha is -1");
+                it1++;
+                continue;
+            }
+            // auto tile = topo.getTile(std::get<1>(*it));
+            auto tile = topo.getTile(cha_id);
+            // SPDLOG_TRACE("cha {}, is colocated with core {}", cha_id, tile.core);
+            // if (thread_to_core[tid_pair.first] == -1)
+            {
+                // SPDLOG_INFO("fetching a tile closest to tile with cha {} and core {}, cha supposed to be {}",
+                // tile.cha, tile.core, std::get<1>(*it));
+                auto closest_tile = topo.getClosestTile(tile, mapped_tiles);
+                // auto closest_tile = topo.getClosestTilewithThreshold(tile, mapped_tiles);
+                // SPDLOG_TRACE("* closest _available_ core to cha {} is: {}", tile.cha, closest_tile.core);
+                mapped_tiles.push_back(closest_tile);
+                thread_to_core[tid_pair.first] = closest_tile.core;
+                // SPDLOG_TRACE("assigned thread with id {} to core {}", tid_pair.first, closest_tile.core);
+            }
+#if 0
+            else
+            {
+                SPDLOG_TRACE("--> Already assigned thread with id {} to core {}, skipping it.", tid_pair.first, thread_to_core[tid_pair.first]);
+            }
+#endif
+
+            // if (thread_to_core[tid_pair.second] == -1)
+            {
+                // SPDLOG_INFO("fetching a tile closest to tile with cha {} and core {}, cha supposed to be {}",
+                // tile.cha, tile.core, std::get<1>(*it));
+                auto closest_tile = topo.getClosestTile(tile, mapped_tiles);
+                // auto closest_tile = topo.getClosestTilewithThreshold(tile, mapped_tiles);
+                // SPDLOG_TRACE("# closest _available_ core to cha {} is: {}", tile.cha, closest_tile.core);
+                mapped_tiles.push_back(closest_tile);
+                thread_to_core[tid_pair.second] = closest_tile.core;
+                // SPDLOG_TRACE("assigned thread with id {} to core {}", tid_pair.second, closest_tile.core);
+            }
+#if 0
+            else
+            {
+                SPDLOG_TRACE("--> Already assigned thread with id {} to core {}, skipping it.", tid_pair.second, thread_to_core[tid_pair.second]);
+            }
+#endif
+        }
+        //#if 0
+        else if (thread_to_core[tid_pair.first] == -1) {
+            auto tile = topo.getTileByCore(thread_to_core[tid_pair.second]);
+            auto closest_tile = topo.getClosestTile(tile, mapped_tiles);
+            mapped_tiles.push_back(closest_tile);
+            thread_to_core[tid_pair.first] = closest_tile.core;
+        } else if (thread_to_core[tid_pair.second] == -1) {
+            auto tile = topo.getTileByCore(thread_to_core[tid_pair.first]);
+            auto closest_tile = topo.getClosestTile(tile, mapped_tiles);
+            mapped_tiles.push_back(closest_tile);
+            thread_to_core[tid_pair.second] = closest_tile.core;
+        }
+        //#endif
+
+        it1++;
+    }
+    // end
+
+
+    const auto algo_end = high_resolution_clock::now();
+    std::cout << "Ended preprocesing algo. elapsed time: " << duration_cast<milliseconds>(algo_end - algo_start).count() << "ms" << std::endl;
+
+    int ii = 0;
+    for (auto ptr : thread_to_core) {
+        std::cout << "thread " << i << " is mapped to core " << ptr << std::endl;
+        // SPDLOG_INFO("thread {} is mapped to core {} ", ii, ptr);
+        ii++;
+    }
+
+    assert(thread_to_core.size() == P);
+    topo.printTopology();
+
+
+
+
+  // cha aware BM.
+  std::cout << "Now running cha aware BM" << std::endl;
+	assert(__threads__<__MAX_THREADS__);
+
+  const auto cha_aware_start = high_resolution_clock::now();
+	pthread_mutex_lock(&__intern__);
+	for (int i = 0; i < (P) - 1; i++) {
+		const int Error = pthread_create(&__tid__[__threads__++], NULL, SlaveStart, static_cast<void*>(thread_to_core.data()));
+		if (Error != 0) {
+			printf("Error in pthread_create().\n");
+			exit(-1);
+		}
+	}
+	pthread_mutex_unlock(&__intern__);
+
+	SlaveStart(static_cast<void*>(thread_to_core.data()));
+
+
+  // std::cout << "WAITING FOR JOIN..." << std::endl;
+  {int aantal=P; while (aantal--) pthread_join(__tid__[aantal], NULL);};
+  // std::cout << "AFTER JOIN. ended cha aware bm" << std::endl;
+
+  const auto cha_aware_end = high_resolution_clock::now();
+  const auto elapsed_cha_aware = duration_cast<milliseconds>(cha_aware_end - cha_aware_start).count();
+  std::cout << "Ended cha aware BM. elapsed time: " << elapsed_cha_aware << "ms" << std::endl;
+
+  Global->id = 0; // reset the id.
+  __threads__ = 0; // reset this, too.
+  (Global->start).bar_teller=0; // reset.
+  InitA(rhs); // reset.
+  // END OF cha aware BM.
+
+
+  
+
+
+
+
+  // base BM.
+  std::cout << "Now running base BM" << std::endl;
+	assert(__threads__<__MAX_THREADS__);
+
+  const auto base_start = high_resolution_clock::now();
+	pthread_mutex_lock(&__intern__);
+	for (int i = 0; i < (P) - 1; i++) {
+		const int Error = pthread_create(&__tid__[__threads__++], NULL, SlaveStart, static_cast<void*>(base_assigned_cores.data()));
+		if (Error != 0) {
+			printf("Error in pthread_create().\n");
+			exit(-1);
+		}
+	}
+	pthread_mutex_unlock(&__intern__);
+
+	SlaveStart(static_cast<void*>(base_assigned_cores.data()));
+
+
+  // std::cout << "WAITING FOR JOIN..." << std::endl;
+  {int aantal=P; while (aantal--) pthread_join(__tid__[aantal], NULL);};
+  // std::cout << "AFTER JOIN. ended base bm" << std::endl;
+
+  const auto base_end = high_resolution_clock::now();
+  const auto elapsed_base = duration_cast<milliseconds>(base_end - base_start).count();
+  std::cout << "Ended base BM. elapsed time: " << elapsed_base << "ms" << std::endl;
+
+
+  // NO NEED TO RESET FROM NOW ON!
+  // Global->id = 0; // reset the id.
+  // __threads__ = 0; // reset this, too.
+  // (Global->start).bar_teller=0; // reset.
+  // InitA(rhs); // reset.
+
+  // END OF base BM.
+
+
+
+
+
+  std::cout << "latency improv percentage: " << ((elapsed_base - elapsed_cha_aware) / static_cast<double>(elapsed_base)) * 100 << std::endl;
+
+
 
   if (doprint) {
     printf("\nMatrix after decomposition:\n");
@@ -502,8 +791,18 @@ int main(int argc, char *argv[])
   {exit(0);};
 }
 
-void SlaveStart()
+void* SlaveStart(void* data)
 {
+  assert(data);
+
+  int* cores = static_cast<int*>(data);
+  // std::cout << "cores: ";
+  // for(int i = 0; i < 28; ++i) {
+  //   std::cout << i << ' ';
+  // }
+  // std::cout << std::endl;
+  // return nullptr;
+
   long MyNum;
 
   {pthread_mutex_lock(&(Global->idlock));}
@@ -511,10 +810,14 @@ void SlaveStart()
     Global->id ++;
   {pthread_mutex_unlock(&(Global->idlock));}
 
-/* POSSIBLE ENHANCEMENT:  Here is where one might pin processes to
-   processors to avoid migration */
+  // std::cout << "id: " << MyNum << ", core: " << cores[static_cast<int>(MyNum)] << std::endl;
+
+  stick_this_thread_to_core(cores[static_cast<int>(MyNum)]);
 
   OneSolve(n, block_size, MyNum, dostats);
+
+  // std::cout << "END OF THREAD: #" << MyNum << std::endl;
+  return nullptr;
 }
 
 
@@ -602,7 +905,7 @@ pthread_mutex_unlock(&((Global->start).bar_mutex));}
 }
 
 
-void lu0(double *a, long n, long stride)
+void lu0(double *a, long n, long stride, long MyNum)
 {
   long j, k, length;
   double alpha;
@@ -611,15 +914,21 @@ void lu0(double *a, long n, long stride)
     /* modify subsequent columns */
     for (j=k+1; j<n; j++) {
       a[k+j*stride] /= a[k+k*stride]; // a written
+
+      {
+        std::lock_guard lock(map_mutex);
+        threadid_addresses_map[MyNum].insert(&a[k+j*stride]);
+      }
+
       alpha = -a[k+j*stride];
       length = n-k-1;
-      daxpy(&a[k+1+j*stride], &a[k+1+k*stride], n-k-1, alpha);
+      daxpy(&a[k+1+j*stride], &a[k+1+k*stride], n-k-1, alpha, MyNum);
     }
   }
 }
 
 
-void bdiv(double *a, double *diag, long stride_a, long stride_diag, long dimi, long dimk)
+void bdiv(double *a, double *diag, long stride_a, long stride_diag, long dimi, long dimk, long MyNum)
 {
   long j, k;
   double alpha;
@@ -627,13 +936,13 @@ void bdiv(double *a, double *diag, long stride_a, long stride_diag, long dimi, l
   for (k=0; k<dimk; k++) {
     for (j=k+1; j<dimk; j++) {
       alpha = -diag[k+j*stride_diag];
-      daxpy(&a[j*stride_a], &a[k*stride_a], dimi, alpha);
+      daxpy(&a[j*stride_a], &a[k*stride_a], dimi, alpha, MyNum);
     }
   }
 }
 
 
-void bmodd(double *a, double *c, long dimi, long dimj, long stride_a, long stride_c)
+void bmodd(double *a, double *c, long dimi, long dimj, long stride_a, long stride_c, long MyNum)
 {
   long j, k, length;
   double alpha;
@@ -641,14 +950,20 @@ void bmodd(double *a, double *c, long dimi, long dimj, long stride_a, long strid
   for (k=0; k<dimi; k++)
     for (j=0; j<dimj; j++) {
       c[k+j*stride_c] /= a[k+k*stride_a]; // a written
+
+      {
+        std::lock_guard lock(map_mutex);
+        threadid_addresses_map[MyNum].insert(&c[k+j*stride_c]);
+      }
+
       alpha = -c[k+j*stride_c];
       length = dimi - k - 1;
-      daxpy(&c[k+1+j*stride_c], &a[k+1+k*stride_a], dimi-k-1, alpha);
+      daxpy(&c[k+1+j*stride_c], &a[k+1+k*stride_a], dimi-k-1, alpha, MyNum);
     }
 }
 
 
-void bmod(double *a, double *b, double *c, long dimi, long dimj, long dimk, long stride)
+void bmod(double *a, double *b, double *c, long dimi, long dimj, long dimk, long stride, long MyNum)
 {
   long j, k;
   double alpha;
@@ -656,18 +971,23 @@ void bmod(double *a, double *b, double *c, long dimi, long dimj, long dimk, long
   for (k=0; k<dimk; k++) {
     for (j=0; j<dimj; j++) {
       alpha = -b[k+j*stride];
-      daxpy(&c[j*stride], &a[k*stride], dimi, alpha);
+      daxpy(&c[j*stride], &a[k*stride], dimi, alpha, MyNum);
     }
   }
 }
 
 
-void daxpy(double *a, double *b, long n, double alpha)
+void daxpy(double *a, double *b, long n, double alpha, long MyNum)
 {
   long i;
 
   for (i=0; i<n; i++) {
     a[i] += alpha*b[i]; // a written
+
+    {
+      std::lock_guard lock(map_mutex);
+      threadid_addresses_map[MyNum].insert(&a[i]);
+    }
   }
 }
 
@@ -709,7 +1029,7 @@ void lu(long n, long bs, long MyNum, struct LocalCopies *lc, long dostats)
     /* factor diagonal block */
     if (BlockOwner(K, K) == MyNum) {
       A = &(a[k+k*n]); 
-      lu0(A, kl-k, strI);
+      lu0(A, kl-k, strI, MyNum);
     }
 
     if ((MyNum == 0) || (dostats)) {
@@ -742,7 +1062,7 @@ pthread_mutex_unlock(&((Global->start).bar_mutex));}
           il = n;
         }
         A = &(a[i+k*n]);
-        bdiv(A, D, strI, n, il-i, kl-k);
+        bdiv(A, D, strI, n, il-i, kl-k, MyNum);
       }
     }
     /* modify row k by diagonal block */
@@ -754,7 +1074,7 @@ pthread_mutex_unlock(&((Global->start).bar_mutex));}
           jl = n;
         }
         A = &(a[k+j*n]);
-        bmodd(D, A, kl-k, jl-j, n, strI);
+        bmodd(D, A, kl-k, jl-j, n, strI, MyNum);
       }
     }
 
@@ -794,7 +1114,7 @@ pthread_mutex_unlock(&((Global->start).bar_mutex));}
 //		if (K == 0) printf("%lx\n", BlockOwner(I, J));
           B = &(a[k+j*n]);
           C = &(a[i+j*n]);
-          bmod(A, B, C, il-i, jl-j, kl-k, n);
+          bmod(A, B, C, il-i, jl-j, kl-k, n, MyNum);
         }
       }
     }
